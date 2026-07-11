@@ -309,7 +309,7 @@ impl PointerButton {
         }
     }
 
-    fn evdev_code(self) -> i32 {
+    pub(crate) fn evdev_code(self) -> i32 {
         match self {
             Self::Left => BTN_LEFT,
             Self::Right => BTN_RIGHT,

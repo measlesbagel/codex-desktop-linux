@@ -5,6 +5,7 @@ use crate::atspi_tree::{
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::niri::{self, PointerScope};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
     scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
@@ -12,8 +13,8 @@ use crate::remote_desktop::{
     ScrollDirection,
 };
 use crate::screenshot::{
-    capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
-    ScreenshotOutputFormat, ScreenshotPayloadOptions,
+    capture_screenshot_raw, capture_screenshot_raw_for_output, prepare_screenshot_payload,
+    RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
 use crate::windowing::registry;
 use crate::windows::{
@@ -57,7 +58,7 @@ pub struct ComputerUseLinux {
     last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
     portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
-    /// Lazily-created uinput absolute pointer (preferred coordinate backend).
+    /// Lazily-created uinput absolute pointer used after compositor-native input.
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
@@ -255,12 +256,15 @@ impl ComputerUseLinux {
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
         let (screenshot, screenshot_error) = if include_screenshot {
-            match capture_screenshot_raw()
-                .await
-                .and_then(|raw| prepare_screenshot_payload(raw, screenshot_options))
-            {
-                Ok(capture) => (Some(capture), None),
-                Err(error) => (None, Some(format!("{error:#}"))),
+            match niri::read_only_capture_output(window_context.as_ref()) {
+                Ok(output_name) => match capture_screenshot_raw_for_output(output_name)
+                    .await
+                    .and_then(|raw| prepare_screenshot_payload(raw, screenshot_options))
+                {
+                    Ok(capture) => (Some(capture), None),
+                    Err(error) => (None, Some(format!("{error:#}"))),
+                },
+                Err(error) => (None, Some(error)),
             }
         } else {
             (None, None)
@@ -352,7 +356,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised first; backends with global window bounds crop to it, while output-scoped backends capture its logical output and report output-local coordinates. Returns the image plus coordinate-space metadata; callers can request jpeg/quality for compression before resizing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -370,6 +374,7 @@ impl ComputerUseLinux {
         // resolve its bounds so we can crop to just that window.
         let mut crop: Option<crate::windowing::WindowBounds> = None;
         let mut window_label: Option<String> = None;
+        let mut capture_output_name: Option<String> = None;
         if let Some(target) = &target {
             if params.raise_window.unwrap_or(true) {
                 let _ = focus_window_target(target).await;
@@ -378,17 +383,23 @@ impl ComputerUseLinux {
             if !params.full_screen.unwrap_or(false) {
                 if let Ok(windows) = list_windows().await {
                     if let Ok(window) = resolve_window_target(&windows, target) {
-                        crop = window.bounds.clone();
                         window_label = window.title.clone();
+                        capture_output_name = niri::focused_capture_output(window)
+                            .map_err(|message| ErrorData::internal_error(message, None))?;
+                        if capture_output_name.is_none() {
+                            crop = window.bounds.clone();
+                        }
                     }
                 }
             }
         }
 
-        let raw_capture = capture_screenshot_raw()
+        let raw_capture = capture_screenshot_raw_for_output(capture_output_name)
             .await
             .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
-        self.cache_desktop_size(raw_capture.width, raw_capture.height);
+        if raw_capture.coordinate_space == "desktop" {
+            self.cache_desktop_size(raw_capture.width, raw_capture.height);
+        }
 
         // Warn when the target window extends past the visible desktop: the
         // portal only captures on-screen pixels, so the crop silently loses the
@@ -407,6 +418,9 @@ impl ComputerUseLinux {
                         source: raw_capture.source.clone(),
                         width: cw,
                         height: ch,
+                        capture_scope: "window".to_string(),
+                        coordinate_space: "window".to_string(),
+                        output_name: raw_capture.output_name.clone(),
                     },
                     true,
                 ),
@@ -433,6 +447,9 @@ impl ComputerUseLinux {
             "format": capture.format,
             "quality": capture.quality,
             "source": capture.source,
+            "capture_scope": capture.capture_scope,
+            "coordinate_space": capture.coordinate_space,
+            "output_name": capture.output_name,
             "cropped_to_window": cropped,
             "window_title": window_label,
         });
@@ -447,7 +464,7 @@ impl ComputerUseLinux {
     }
 
     /// Lazily create the uinput absolute pointer, sizing its ABS range to the
-    /// logical desktop (the portal screenshot dimensions). Returns `false` if it
+    /// screenshot coordinate dimensions. Returns `false` if it
     /// can't be created or is disabled via `CU_DISABLE_ABS_POINTER` (or the
     /// Codex embedded-build alias).
     async fn ensure_abs_pointer(&self) -> bool {
@@ -511,7 +528,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index, semantic selector, or coordinate pixels from screenshot metadata. Pass output_name with explicit x/y from an output-scoped screenshot; omit it for desktop screenshot coordinates. Window targeting controls focus independently of coordinate space.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -521,6 +538,21 @@ impl ComputerUseLinux {
     )]
     async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let pointer_scope = match PointerScope::requested(
+            params.output_name.as_deref(),
+            params.x.zip(params.y).is_some(),
+        ) {
+            Ok(output_name) => output_name,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
@@ -546,6 +578,17 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            if let Err(message) =
+                pointer_scope.validate_window(focus.as_ref().map(|focus| &focus.requested_window))
+            {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message,
+                    received,
+                });
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -629,22 +672,36 @@ impl ComputerUseLinux {
             unreachable!("click target must resolve to coordinates or an AT-SPI action");
         };
         let button = mouse_button_code(params.button.as_deref());
-        let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
-        // Preferred backend: the uinput absolute pointer. Unlike ydotool's
+        let click_count = params.click_count.unwrap_or(1).clamp(1, 10);
+        // Preferred fallback backend: the uinput absolute pointer. Unlike ydotool's
         // relative-only device (faked `--absolute` via pin-to-corner + relative
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
         // absolute pointer lands exactly at the screenshot pixel.
         // Off-screen coordinates "succeed" at the uinput layer while landing on
         // no visible pixel — surface that instead of a silent no-op.
-        let off_screen_note = self.off_screen_note_for_point(x, y).await;
+        let off_screen_note = if pointer_scope.is_output_scoped() {
+            None
+        } else {
+            self.off_screen_note_for_point(x, y).await
+        };
+        if let Some(result) = niri::try_click(
+            &pointer_scope,
+            x,
+            y,
+            u32::try_from(PointerButton::from_name(params.button.as_deref()).evdev_code())
+                .expect("pointer button codes are positive"),
+            click_count,
+        )
+        .await
+        {
+            return Json(with_notes(
+                message_action_result("click", result, received),
+                off_screen_note.clone(),
+            ));
+        }
         if self
-            .try_abs_click(
-                x,
-                y,
-                params.button.as_deref(),
-                params.click_count.unwrap_or(1).clamp(1, 10),
-            )
+            .try_abs_click(x, y, params.button.as_deref(), click_count)
             .await
             == Some(true)
         {
@@ -665,7 +722,7 @@ impl ComputerUseLinux {
                 x,
                 y,
                 PointerButton::from_name(params.button.as_deref()),
-                params.click_count.unwrap_or(1).clamp(1, 10),
+                click_count,
             )
             .await
             {
@@ -690,7 +747,7 @@ impl ComputerUseLinux {
                     x,
                     y,
                     PointerButton::from_name(params.button.as_deref()),
-                    params.click_count.unwrap_or(1).clamp(1, 10),
+                    click_count,
                 )
                 .await
                 {
@@ -718,7 +775,7 @@ impl ComputerUseLinux {
             vec![
                 "click".to_string(),
                 "--repeat".to_string(),
-                click_count,
+                click_count.to_string(),
                 button,
             ],
         ])
@@ -808,7 +865,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre when global window bounds are available. Pass output_name with explicit x/y from an output-scoped screenshot; omit it for desktop screenshot coordinates.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -819,6 +876,21 @@ impl ComputerUseLinux {
     async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+        let pointer_scope = match PointerScope::requested(
+            params.output_name.as_deref(),
+            params.x.zip(params.y).is_some(),
+        ) {
+            Ok(output_name) => output_name,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "scroll".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
         let window_target = params.window_target();
@@ -844,6 +916,17 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            if let Err(message) =
+                pointer_scope.validate_window(focus.as_ref().map(|focus| &focus.requested_window))
+            {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "scroll".to_string(),
+                    message,
+                    received,
+                });
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
@@ -921,10 +1004,26 @@ impl ComputerUseLinux {
                 });
             }
         };
-        let off_screen_note = match target_point {
-            Some((x, y)) => self.off_screen_note_for_point(x, y).await,
-            None => None,
+        let off_screen_note = match (target_point, pointer_scope.is_output_scoped()) {
+            (_, true) => None,
+            (Some((x, y)), false) => self.off_screen_note_for_point(x, y).await,
+            (None, false) => None,
         };
+
+        let (horizontal, native_steps) = match direction {
+            ScrollDirection::Up => (false, -units),
+            ScrollDirection::Down => (false, units),
+            ScrollDirection::Left => (true, -units),
+            ScrollDirection::Right => (true, units),
+        };
+        if let Some(result) =
+            niri::try_scroll(&pointer_scope, target_point, horizontal, native_steps).await
+        {
+            return Json(with_notes(
+                message_action_result("scroll", result, received),
+                off_screen_note.clone(),
+            ));
+        }
 
         if let Some(session) = self.cached_portal_pointer_session() {
             match portal_scroll(&session, target_point, direction, units).await {
@@ -996,7 +1095,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "drag",
-        description = "Drag from one point to another using pixel coordinates.",
+        description = "Drag from one point to another using screenshot coordinate pixels. Pass output_name for coordinates from an output-scoped screenshot.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1006,7 +1105,32 @@ impl ComputerUseLinux {
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
-        // Preferred backend: the uinput absolute pointer (accurate landing).
+        let pointer_scope = match PointerScope::requested(params.output_name.as_deref(), true) {
+            Ok(pointer_scope) => pointer_scope,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "drag".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
+        let start = (params.start_x, params.start_y);
+        let end = (params.end_x, params.end_y);
+        if let Some(result) = niri::try_drag(
+            &pointer_scope,
+            start,
+            end,
+            u32::try_from(PointerButton::Left.evdev_code())
+                .expect("pointer button codes are positive"),
+        )
+        .await
+        {
+            return Json(message_action_result("drag", result, received));
+        }
+        // Preferred fallback backend: the uinput absolute pointer (accurate landing).
         if self.ensure_abs_pointer().await {
             let abs_pointer = Arc::clone(&self.abs_pointer);
             let dragged = tokio::task::spawn_blocking(move || {
@@ -1120,7 +1244,7 @@ impl ComputerUseLinux {
                 });
             }
         };
-        let Some(key_events) = key_sequence(&params.key) else {
+        let Some(key_events) = key_event_sequence(&params.key) else {
             return Json(ActionOutput {
                 ok: false,
                 implemented: true,
@@ -1129,8 +1253,26 @@ impl ComputerUseLinux {
                 received,
             });
         };
+        if let Some(result) = niri::try_press_key(
+            key_events
+                .iter()
+                .map(|event| (event.keycode, event.pressed))
+                .collect(),
+        )
+        .await
+        {
+            let mut output = with_focus_context(
+                message_action_result("press_key", result, received),
+                focus.clone(),
+            );
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), false).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
         let mut args = vec!["key".to_string()];
-        args.extend(key_events);
+        args.extend(key_events.iter().copied().map(KeyEvent::ydotool_arg));
         let result = run_ydotool(&args).await.map(|output| vec![output]);
         let mut output = action_result_with_focus("press_key", result, received, focus.clone());
         if output.ok && focus.is_some() {
@@ -1142,7 +1284,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "type_text",
-        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector.",
+        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector. Compositor-native virtual-keyboard backends preserve Unicode text independently of the configured physical keyboard layout.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1167,6 +1309,17 @@ impl ComputerUseLinux {
                 });
             }
         };
+        if let Some(result) = niri::try_type_text(params.text.clone()).await {
+            let mut output = with_focus_context(
+                message_action_result("type_text", result, received),
+                focus.clone(),
+            );
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
+        }
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
@@ -1303,7 +1456,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.3.1-linux-alpha1",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through compositor-native WLR screencopy when available, GNOME Shell, the Codex GNOME Shell extension, or XDG Desktop Portal; read AT-SPI trees with action/value metadata; invoke native AT-SPI actions; set AT-SPI values or editable text; and list/focus compositor windows through registered Linux window backends when the session permits it. Coordinate click/scroll/drag input uses a compositor-native virtual pointer when available before the existing uinput, portal, and ydotool paths; press_key and literal type_text similarly prefer a compositor-native virtual keyboard. Otherwise, literal type_text uses KDE clipboard integration on Plasma Wayland or portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height, scale, capture_scope, coordinate_space, and output_name. A window-targeted screenshot on a backend without global window bounds captures the target's logical output rather than claiming an unavailable exact window crop; pass its output_name with explicit x/y to select output-local coordinates. Omit output_name for desktop screenshot coordinates; window selectors control focus and do not change coordinate space. Request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state is read-only and will not switch to an inactive workspace; use screenshot with the same window target when a focused capture is needed. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1627,6 +1780,9 @@ struct ClickParams {
     x: Option<i32>,
     #[serde(default)]
     y: Option<i32>,
+    /// Output name when x/y come from an output-scoped screenshot.
+    #[serde(default)]
+    output_name: Option<String>,
     #[serde(default)]
     button: Option<String>,
     #[serde(default)]
@@ -1750,6 +1906,9 @@ struct ScrollParams {
     x: Option<i32>,
     #[serde(default)]
     y: Option<i32>,
+    /// Output name when x/y come from an output-scoped screenshot.
+    #[serde(default)]
+    output_name: Option<String>,
     direction: String,
     #[serde(default)]
     pages: Option<f64>,
@@ -1803,6 +1962,9 @@ struct DragParams {
     start_y: i32,
     end_x: i32,
     end_y: i32,
+    /// Output name when coordinates come from an output-scoped screenshot.
+    #[serde(default)]
+    output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2112,11 +2274,9 @@ impl ComputerUseLinux {
         }
     }
 
-    /// COORDINATE SPACES: window bounds (list_windows / extension frame rects)
-    /// and the extension monitor layout are in LOGICAL pixels, while click/
-    /// scroll coordinates and screenshot captures are in PHYSICAL capture
-    /// pixels. On fractionally-scaled displays the two differ, so each check
-    /// below only ever compares values from the same space.
+    /// COORDINATE SPACES: window bounds and extension monitor layouts are in
+    /// logical pixels. Screenshot coordinates may be logical or backend capture
+    /// pixels, so each check below only compares matching spaces.
     ///
     /// Logical monitor rectangles from the GNOME Shell extension, for checks
     /// against logical window bounds. None when the extension is unavailable.
@@ -2132,8 +2292,8 @@ impl ComputerUseLinux {
         })
     }
 
-    /// Physical capture-space desktop rectangle (union of monitors as captured
-    /// by the screenshot pipeline), for checks against click coordinates.
+    /// Screenshot coordinate-space desktop rectangle (union of captured
+    /// monitors), for checks against click coordinates.
     /// Best-effort; None disables the check.
     async fn capture_space_rect(&self) -> Option<(i32, i32, i32, i32)> {
         let cached = self.desktop_size.lock().ok().and_then(|guard| *guard);
@@ -3129,6 +3289,29 @@ fn action_result(
     }
 }
 
+fn message_action_result(
+    action: &str,
+    result: std::result::Result<String, String>,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    match result {
+        Ok(message) => ActionOutput {
+            ok: true,
+            implemented: true,
+            action: action.to_string(),
+            message,
+            received,
+        },
+        Err(message) => ActionOutput {
+            ok: false,
+            implemented: true,
+            action: action.to_string(),
+            message,
+            received,
+        },
+    }
+}
+
 fn action_result_with_focus(
     action: &str,
     result: std::result::Result<Vec<Output>, String>,
@@ -3588,7 +3771,19 @@ fn mouse_button_code(button: Option<&str>) -> String {
     .to_string()
 }
 
-fn key_sequence(key: &str) -> Option<Vec<String>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyEvent {
+    keycode: u16,
+    pressed: bool,
+}
+
+impl KeyEvent {
+    fn ydotool_arg(self) -> String {
+        format!("{}:{}", self.keycode, u8::from(self.pressed))
+    }
+}
+
+fn key_event_sequence(key: &str) -> Option<Vec<KeyEvent>> {
     let parts = key
         .split('+')
         .map(str::trim)
@@ -3597,7 +3792,16 @@ fn key_sequence(key: &str) -> Option<Vec<String>> {
     let (key_part, modifier_parts) = parts.split_last()?;
     if modifier_parts.is_empty() {
         if let Some(modifier) = modifier_keycode(key_part) {
-            return Some(vec![format!("{modifier}:1"), format!("{modifier}:0")]);
+            return Some(vec![
+                KeyEvent {
+                    keycode: modifier,
+                    pressed: true,
+                },
+                KeyEvent {
+                    keycode: modifier,
+                    pressed: false,
+                },
+            ]);
         }
     }
     let mut modifiers = Vec::new();
@@ -3608,14 +3812,31 @@ fn key_sequence(key: &str) -> Option<Vec<String>> {
 
     let mut events = Vec::new();
     for modifier in &modifiers {
-        events.push(format!("{modifier}:1"));
+        events.push(KeyEvent {
+            keycode: *modifier,
+            pressed: true,
+        });
     }
-    events.push(format!("{keycode}:1"));
-    events.push(format!("{keycode}:0"));
+    events.push(KeyEvent {
+        keycode,
+        pressed: true,
+    });
+    events.push(KeyEvent {
+        keycode,
+        pressed: false,
+    });
     for modifier in modifiers.iter().rev() {
-        events.push(format!("{modifier}:0"));
+        events.push(KeyEvent {
+            keycode: *modifier,
+            pressed: false,
+        });
     }
     Some(events)
+}
+
+#[cfg(test)]
+fn key_sequence(key: &str) -> Option<Vec<String>> {
+    key_event_sequence(key).map(|events| events.into_iter().map(KeyEvent::ydotool_arg).collect())
 }
 
 fn modifier_keycode(key: &str) -> Option<u16> {
@@ -3773,6 +3994,14 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
 
+    struct NiriFocusRestore(u64);
+
+    impl Drop for NiriFocusRestore {
+        fn drop(&mut self) {
+            let _ = crate::niri::activate_window(self.0);
+        }
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original: Option<std::ffi::OsString>,
@@ -3850,6 +4079,9 @@ mod tests {
                 source: "test".to_string(),
                 width,
                 height,
+                capture_scope: "window".to_string(),
+                coordinate_space: "window".to_string(),
+                output_name: None,
             },
             ScreenshotPayloadOptions {
                 max_width: Some(100),
@@ -4855,12 +5087,66 @@ mod tests {
         assert!(!described.contains("WARNING"));
     }
 
+    #[tokio::test]
+    async fn live_niri_targeted_screenshot_focuses_and_captures_output_when_requested() {
+        if std::env::var("CODEX_TEST_NIRI_TARGETED_SCREENSHOT").as_deref() != Ok("1") {
+            return;
+        }
+        let windows = crate::windowing::backends::niri::list_windows().unwrap();
+        let original = windows
+            .iter()
+            .find(|window| window.focused)
+            .unwrap()
+            .window_id;
+        let _restore = NiriFocusRestore(original);
+        let target = windows
+            .iter()
+            .find(|window| {
+                crate::niri::output_for_window(window.window_id)
+                    .is_ok_and(|output| !output.workspace_active)
+            })
+            .unwrap();
+        let expected_output = crate::niri::output_for_window(target.window_id)
+            .unwrap()
+            .output_name;
+        let result = ComputerUseLinux::default()
+            .screenshot(Parameters(ScreenshotParams {
+                window_id: Some(target.window_id),
+                max_width: Some(320),
+                max_height: Some(320),
+                max_bytes: Some(200_000),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        let caption = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|content| content["type"] == "text")
+            .and_then(|content| content["text"].as_str())
+            .map(|caption| serde_json::from_str::<serde_json::Value>(caption).unwrap())
+            .unwrap();
+
+        assert_eq!(caption["capture_scope"], "output");
+        assert_eq!(caption["coordinate_space"], "output");
+        assert_eq!(caption["output_name"], expected_output);
+        assert_eq!(caption["cropped_to_window"], false);
+        assert!(
+            crate::niri::output_for_window(target.window_id)
+                .unwrap()
+                .workspace_active
+        );
+    }
+
     #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
             element_index: None,
             x: Some(10),
             y: Some(20),
+            output_name: None,
             direction: "down".to_string(),
             pages: None,
             window_id: Some(1),
@@ -4889,6 +5175,7 @@ mod tests {
             element_index: None,
             x: None,
             y: None,
+            output_name: None,
             direction: "down".to_string(),
             pages: None,
             window_id: Some(1),
@@ -4917,6 +5204,7 @@ mod tests {
             element_index: None,
             x: None,
             y: None,
+            output_name: None,
             direction: "down".to_string(),
             pages: None,
             window_id: Some(1),
@@ -4948,6 +5236,7 @@ mod tests {
             element_index: None,
             x: Some(801),
             y: Some(20),
+            output_name: None,
             direction: "down".to_string(),
             pages: None,
             window_id: Some(1),

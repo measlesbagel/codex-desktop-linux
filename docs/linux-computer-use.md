@@ -7,12 +7,14 @@ the in-app Computer Use controls are disabled until you opt in.
 It supports:
 
 - app listing and accessibility trees through AT-SPI
-- screenshots through GNOME Shell DBus, the Codex GNOME Shell extension, or XDG Desktop Portal
-- window listing and focusing on GNOME, KWin/Plasma, Hyprland, COSMIC, and i3
-- keyboard, text, click, scroll, and drag input through `/dev/uinput`, XDG
-  RemoteDesktop portal, or `ydotool`
+- screenshots through GNOME Shell DBus, the Codex GNOME Shell extension, Niri, or XDG Desktop Portal
+- window listing and focusing on GNOME, KWin/Plasma, niri, Hyprland, COSMIC, and i3
+- Niri-native text, key, and pointer input, plus the existing portal, `/dev/uinput`,
+  and `ydotool` fallback paths
 
 ## Runtime Dependencies
+
+Niri screenshot, text, key, and pointer input needs no additional runtime package.
 
 Install `ydotool` when you need the fallback input path:
 
@@ -31,8 +33,8 @@ sudo pacman -S ydotool
 sudo zypper install ydotool
 ```
 
-The preferred coordinate input path opens `/dev/uinput` directly. The XDG
-RemoteDesktop portal can also provide input on desktops that expose it.
+Outside Niri, the preferred coordinate input path opens `/dev/uinput` directly.
+The XDG RemoteDesktop portal can also provide input on desktops that expose it.
 
 For `ydotool`, run a daemon and make sure your user can access the socket:
 

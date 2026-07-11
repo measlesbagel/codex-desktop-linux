@@ -1,4 +1,4 @@
-use crate::{diagnostics::hydrate_session_bus_env, identity};
+use crate::{diagnostics::hydrate_session_bus_env, identity, niri};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
@@ -40,6 +40,9 @@ pub struct RawScreenshotCapture {
     pub source: String,
     pub width: u32,
     pub height: u32,
+    pub capture_scope: String,
+    pub coordinate_space: String,
+    pub output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -63,6 +66,10 @@ pub struct ScreenshotCapture {
     pub max_bytes: usize,
     pub format: ScreenshotOutputFormat,
     pub quality: Option<u8>,
+    pub capture_scope: String,
+    pub coordinate_space: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -145,11 +152,12 @@ impl ScreenshotPayloadOptions {
 
 /// Environment variable forcing a single capture backend, skipping the
 /// fallback chain. Accepts `gnome-shell`, `gnome-extension`, `portal`, or
-/// `gnome-screenshot`.
+/// `gnome-screenshot`, or `niri`.
 const SCREENSHOT_BACKEND_ENV: &str = "CODEX_COMPUTER_USE_SCREENSHOT_BACKEND";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenshotBackend {
+    Niri,
     GnomeShell,
     GnomeExtension,
     Portal,
@@ -159,6 +167,7 @@ enum ScreenshotBackend {
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "niri" | "niri-wlr" | "niri_wlr" => Some(Self::Niri),
             "gnome-shell" | "gnome_shell" | "shell" => Some(Self::GnomeShell),
             "gnome-extension" | "gnome_extension" | "extension" => Some(Self::GnomeExtension),
             "portal" | "xdg-portal" | "xdg_portal" => Some(Self::Portal),
@@ -167,8 +176,9 @@ impl ScreenshotBackend {
         }
     }
 
-    async fn capture(self) -> Result<RawScreenshotCapture> {
+    async fn capture(self, niri_output_name: Option<String>) -> Result<RawScreenshotCapture> {
         match self {
+            Self::Niri => capture_with_niri(niri_output_name).await,
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::GnomeExtension => capture_with_gnome_extension().await,
             Self::Portal => capture_with_portal().await,
@@ -178,14 +188,29 @@ impl ScreenshotBackend {
 }
 
 pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
+    capture_screenshot_raw_for_output(None).await
+}
+
+pub async fn capture_screenshot_raw_for_output(
+    niri_output_name: Option<String>,
+) -> Result<RawScreenshotCapture> {
     hydrate_session_bus_env();
 
     // Explicit override: use exactly the requested backend, no fallback. Lets
     // background/systemd contexts pin `gnome-screenshot` when the DBus paths are
     // blocked, and aids debugging.
     if let Some(forced) = forced_backend()? {
-        return forced.capture().await;
+        return forced.capture(niri_output_name).await;
     }
+
+    let niri_error = if niri::is_session() {
+        match capture_with_niri(niri_output_name).await {
+            Ok(capture) => return Ok(capture),
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
 
     // The Shell and portal DBus paths fail for background processes (systemd
     // user services, non-interactive parent shells): GNOME Shell's
@@ -210,8 +235,11 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
         Err(error) => error,
     };
 
+    let niri_detail = niri_error
+        .map(|error| format!("Niri screencopy failed: {error}; "))
+        .unwrap_or_default();
     Err(anyhow!(
-        "GNOME Shell screenshot failed: {gnome_error}; \
+        "{niri_detail}GNOME Shell screenshot failed: {gnome_error}; \
          GNOME Shell extension screenshot failed: {extension_error}; \
          XDG portal screenshot failed: {portal_error}; \
          gnome-screenshot fallback failed: {cli_error}"
@@ -224,7 +252,7 @@ fn forced_backend() -> Result<Option<ScreenshotBackend>> {
             ScreenshotBackend::parse(&value).map(Some).ok_or_else(|| {
                 anyhow!(
                     "{SCREENSHOT_BACKEND_ENV}={value:?} is not a recognized backend \
-                     (expected gnome-shell, gnome-extension, portal, or gnome-screenshot)"
+                     (expected niri, gnome-shell, gnome-extension, portal, or gnome-screenshot)"
                 )
             })
         }
@@ -289,6 +317,35 @@ pub fn prepare_screenshot_payload(
         max_bytes: options.max_bytes,
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
+        capture_scope: raw.capture_scope,
+        coordinate_space: raw.coordinate_space,
+        output_name: raw.output_name,
+    })
+}
+
+async fn capture_with_niri(output_name: Option<String>) -> Result<RawScreenshotCapture> {
+    let capture = niri::capture(output_name).await?;
+    let width = capture.image.width();
+    let height = capture.image.height();
+    let capture_scope = if capture.output_name.is_some() {
+        "output"
+    } else {
+        "desktop"
+    };
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(capture.image)
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .context("failed to encode Niri screencopy as PNG")?;
+
+    Ok(RawScreenshotCapture {
+        mime_type: "image/png".to_string(),
+        bytes,
+        source: "niri-wlr-screencopy".to_string(),
+        width,
+        height,
+        capture_scope: capture_scope.to_string(),
+        coordinate_space: capture_scope.to_string(),
+        output_name: capture.output_name,
     })
 }
 
@@ -537,6 +594,9 @@ fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotC
         source: source.to_string(),
         width,
         height,
+        capture_scope: "desktop".to_string(),
+        coordinate_space: "desktop".to_string(),
+        output_name: None,
     })
 }
 
@@ -764,6 +824,9 @@ mod tests {
             source: "test".to_string(),
             width,
             height,
+            capture_scope: "desktop".to_string(),
+            coordinate_space: "desktop".to_string(),
+            output_name: None,
         }
     }
 
@@ -777,6 +840,10 @@ mod tests {
 
     #[test]
     fn parses_known_backend_names() {
+        assert_eq!(
+            ScreenshotBackend::parse("niri"),
+            Some(ScreenshotBackend::Niri)
+        );
         assert_eq!(
             ScreenshotBackend::parse("gnome-shell"),
             Some(ScreenshotBackend::GnomeShell)
@@ -844,6 +911,9 @@ mod tests {
         assert!(capture.resized);
         assert!(capture.bytes <= DEFAULT_SCREENSHOT_MAX_BYTES);
         assert!(capture.data_url.starts_with("data:image/png;base64,"));
+        assert_eq!(capture.capture_scope, "desktop");
+        assert_eq!(capture.coordinate_space, "desktop");
+        assert_eq!(capture.output_name, None);
     }
 
     #[test]

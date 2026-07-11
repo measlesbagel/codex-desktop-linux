@@ -342,7 +342,9 @@ input_group_summary() {
 window_backend_hint() {
     local desktop="${XDG_CURRENT_DESKTOP:-} ${DESKTOP_SESSION:-} ${XDG_SESSION_DESKTOP:-}"
     desktop="${desktop,,}"
-    if [[ "$desktop" == *hyprland* ]]; then
+    if [[ "$desktop" == *niri* ]]; then
+        printf 'niri -> niri msg IPC backend'
+    elif [[ "$desktop" == *hyprland* ]]; then
         printf 'Hyprland -> hyprctl backend'
     elif [[ "$desktop" == *sway* ]]; then
         printf 'Sway -> not explicitly supported by the current i3 backend; verify with Computer Use doctor after install'

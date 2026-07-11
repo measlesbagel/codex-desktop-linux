@@ -11,6 +11,7 @@ mod cosmic_helper;
 mod diagnostics;
 mod gnome_extension;
 mod identity;
+mod niri;
 mod remote_desktop;
 mod screenshot;
 mod server;
@@ -98,6 +99,9 @@ async fn main() -> Result<()> {
                     "height": capture.height,
                     "coordinate_width": capture.coordinate_width,
                     "coordinate_height": capture.coordinate_height,
+                    "capture_scope": capture.capture_scope,
+                    "coordinate_space": capture.coordinate_space,
+                    "output_name": capture.output_name,
                     "scale": capture.scale,
                     "resized": capture.resized,
                     "bytes": capture.bytes,

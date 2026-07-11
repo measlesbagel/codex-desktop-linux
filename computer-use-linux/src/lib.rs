@@ -4,6 +4,7 @@ pub mod cosmic_helper;
 pub mod diagnostics;
 pub mod gnome_extension;
 pub mod identity;
+pub(crate) mod niri;
 pub mod remote_desktop;
 pub mod screenshot;
 pub mod server;
